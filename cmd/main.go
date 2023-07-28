@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -41,77 +40,6 @@ func getGitMergeBase(a, b string) (string, error) {
 	}
 	sha := strings.TrimSpace(string(out))
 	return sha, nil
-}
-
-func getRemoteBranches(sha string) ([]string, error) {
-	cmd := exec.Command("git", "branch", "-r", "--contains", sha)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-	branches := []string{}
-	for _, line := range strings.Split(string(out), "\n") {
-		branch := strings.TrimSpace(line)
-		if branch != "" {
-			branches = append(branches, branch)
-		}
-	}
-	return branches, nil
-}
-
-func getRemoteURL(remoteName string) (string, error) {
-	cmd := exec.Command("git", "config", "--get", "remote."+remoteName+".url")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-const sshGitPrefix = "git@github.com:"
-
-func formatGithubURL(user, repo, gitSha, path string, line int) string {
-	url := fmt.Sprintf("https://github.com/%s/%s/blob/%s/%s", user, repo, gitSha, path)
-	if line >= 0 {
-		url += fmt.Sprintf("#L%d", line)
-	}
-	return url
-}
-
-func getUserAndRepo(s string) (string, string, error) {
-	parts := strings.Split(strings.TrimSuffix(s, ".git"), "/")
-	if len(parts) != 2 {
-		return "", "", fmt.Errorf("failed to split %s", s)
-	}
-	return parts[0], parts[1], nil
-}
-
-func getGithubURL(gitURL, gitSha, path string, line int) (string, error) {
-	var urlPath string
-	if strings.HasPrefix(gitURL, sshGitPrefix) {
-		urlPath = strings.TrimPrefix(gitURL, sshGitPrefix)
-	} else {
-		u, err := url.Parse(gitURL)
-		if err != nil {
-			return "", err
-		}
-		urlPath = u.Path
-	}
-	user, repo, err := getUserAndRepo(urlPath)
-	if err != nil {
-		return "", err
-	}
-	return formatGithubURL(user, repo, gitSha, path, line), nil
-}
-
-func isFileTracked(path string) error {
-	cmd := exec.Command("git", "ls-files", "--error-unmatch", path)
-	_, err := cmd.Output()
-	if err != nil {
-		return err
-	}
-	return nil
-
 }
 
 func getCommitDiff(commit string) (string, error) {
@@ -154,6 +82,9 @@ func isMerged(currentBranch, branch string) error {
 		return err
 	}
 	commits, err := getCommits(base, currentBranch)
+	if err != nil {
+		return err
+	}
 	for _, commit := range commits {
 		commitDiff, err := getCommitDiff(commit)
 		if err != nil {
