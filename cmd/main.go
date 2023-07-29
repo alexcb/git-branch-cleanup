@@ -105,6 +105,7 @@ func getCommitDiff(commit string) (*CommitDiff, error) {
 	return &commitDiff, nil
 }
 
+// NOTE: this does not return the start commit, but DOES include the end commit
 func getCommits(start, end string) ([]string, error) {
 	lines, err := runCommandSplitLines("git", "log", "--format=format:%H", start+".."+end)
 	if err != nil {
@@ -120,54 +121,77 @@ func getCommits(start, end string) ([]string, error) {
 	return commits, nil
 }
 
-func isMerged(currentBranch, branch string, perfectOnly bool) error {
+// git --no-pager show HEAD is equivalent to git --no-pager diff HEAD^..HEAD **except** show will also show the commit time/author/subject/message details
+// Note that this combines the diffs of commits from start to end INCLUSIVE
+func getGitDiff(start, end string) (string, error) {
+	return runCommandTrimmedOutput("git", "--no-pager", "diff", start+".."+end)
+}
+
+type PotentialMerge struct {
+	Branch       string
+	MergedSha    string
+	SubjectScore float32
+	DiffScore    float32
+	DiffSize     int
+	NumCommits   int
+	DiffCmd      string
+}
+
+func findMerged(currentBranch, branch string) (*PotentialMerge, error) {
 	var highestSubjectScore float32
 	var highestDiff *CommitDiff
 
 	base, err := getGitMergeBase(currentBranch, branch)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	branchSha, err := getGitRevParse(branch)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if base == branchSha {
-		fmt.Printf("git branch -D %s\n", branch)
-		return nil
+		return &PotentialMerge{
+			Branch:       branch,
+			MergedSha:    base,
+			SubjectScore: 1.00,
+			DiffScore:    1.00,
+			NumCommits:   0,
+		}, nil
 	}
 
 	branchCommits, err := getCommits(base, branch)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if len(branchCommits) != 1 {
-		fmt.Fprintf(os.Stderr, "WARNING: %s contains %d commits, skipping\n\n", branch, len(branchCommits))
-		return nil
+	if len(branchCommits) == 0 {
+		panic("branchCommits is empty, but if base == branchSha check didnt catch this")
 	}
-	//TODO squash branches that contain more than one commit
-	branchDiff, err := getCommitDiff(branch)
+
+	var combinedDiff string
+	var highestCombinedDiff string
+	var branchDiff *CommitDiff
+	branchDiff, err = getCommitDiff(branchCommits[0])
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if len(branchCommits) > 1 {
+		combinedDiff, err = getGitDiff(base, branch)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	commits, err := getCommits(base, currentBranch)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, commit := range commits {
 		commitDiff, err := getCommitDiff(commit)
 		if err != nil {
-			return err
+			return nil, err
 		}
-
-		// for a good match
-		// Levenshtein Distance is 70
-		// Trigram Compare is is 70
-		// Jaro Distance is is 0.84454864
-		// Jaro Wingkler Distance is 0.92227435
 
 		sd := beda.NewStringDiff(branchDiff.Subject, commitDiff.Subject)
 		subjectScore := sd.JaroWinklerDistance(0.1)
@@ -175,33 +199,54 @@ func isMerged(currentBranch, branch string, perfectOnly bool) error {
 		if subjectScore > highestSubjectScore {
 			highestSubjectScore = subjectScore
 			highestDiff = commitDiff
+			highestCombinedDiff = combinedDiff
 		}
 	}
 
-	if highestSubjectScore > 0.9 {
-		if perfectOnly {
-			if len(branchDiff.Diff) > 100 && branchDiff.Diff == highestDiff.Diff {
-				fmt.Printf("git branch -D %s\n", branch)
-			}
-			return nil
-		}
+	if highestDiff == nil {
+		return nil, nil
+	}
 
+	var diffScore float32
+	if highestCombinedDiff == "" {
 		// check that the diff contents match too
 		sd := beda.NewStringDiff(branchDiff.Diff, highestDiff.Diff)
-		diffScore := sd.JaroWinklerDistance(0.1)
-		if diffScore > 0.9 {
-			if len(branchDiff.Diff) > 100 && diffScore == 1.0 {
-				fmt.Printf("perfect diff contents match (subject score %f)\n", highestSubjectScore)
-			} else {
-				fmt.Printf("subject score: %f; diff score: %f\n", highestSubjectScore, diffScore)
-			}
-			fmt.Printf("meld <(git show %s) <(git show %s)\n", branch, highestDiff.Sha)
-			fmt.Printf("git branch -D %s\n", branch)
-			fmt.Printf("\n")
+		diffScore = sd.JaroWinklerDistance(0.1)
+
+		if 1 != len(branchCommits) {
+			panic("expected single commit")
 		}
+
+		return &PotentialMerge{
+			Branch:       branch,
+			MergedSha:    branchDiff.Sha,
+			SubjectScore: highestSubjectScore,
+			DiffScore:    diffScore,
+			DiffSize:     len(branchDiff.Diff),
+			NumCommits:   1,
+			DiffCmd:      fmt.Sprintf("meld <(git show %s) <(git show %s)", branch, highestDiff.Sha),
+		}, nil
 	}
 
-	return nil
+	// otherwise we are dealing with a branch that has been squashed
+
+	combinedDiff, err = getGitDiff(highestDiff.Sha+"^", highestDiff.Sha)
+	if err != nil {
+		return nil, err
+	}
+
+	sd := beda.NewStringDiff(combinedDiff, highestCombinedDiff)
+	diffScore = sd.JaroWinklerDistance(0.1)
+
+	return &PotentialMerge{
+		Branch:       branch,
+		MergedSha:    branchDiff.Sha,
+		SubjectScore: highestSubjectScore,
+		DiffScore:    diffScore,
+		DiffSize:     len(combinedDiff),
+		NumCommits:   len(branchCommits),
+		DiffCmd:      fmt.Sprintf("meld <(git --no-pager diff %s..%s) <(git --no-pager diff %s..%s)", base, branch, highestDiff.Sha+"^", highestDiff.Sha),
+	}, nil
 }
 
 type opts struct {
@@ -239,9 +284,35 @@ func main() {
 		if branch == currentBranch {
 			continue // dont try to delete the current branch (e.g. main)
 		}
-		err := isMerged(currentBranch, branch, progOpts.Perfect)
+
+		potentialMerged, err := findMerged(currentBranch, branch)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ignoring %s due to: %s\n", branch, err)
+		}
+		if potentialMerged == nil {
+			continue // likely not merged
+		}
+
+		if potentialMerged.SubjectScore > 0.9 && potentialMerged.DiffScore > 0.9 {
+			perfectDiffMatch := bool(potentialMerged.DiffScore == 1.0 && potentialMerged.DiffSize > 100)
+			if progOpts.Perfect {
+				if perfectDiffMatch {
+					fmt.Printf("git branch -D %s\n", branch)
+				}
+				continue
+			}
+
+			if perfectDiffMatch {
+				fmt.Printf("%s was merged under %s (subject score: %f; diff score %f)\n", branch, potentialMerged.MergedSha, potentialMerged.SubjectScore, potentialMerged.DiffScore)
+			} else {
+				fmt.Printf("%s was **potentially** merged under %s (subject score: %f; diff score %f)\n", branch, potentialMerged.MergedSha, potentialMerged.SubjectScore, potentialMerged.DiffScore)
+			}
+			if potentialMerged.NumCommits > 1 {
+				fmt.Printf("WARNING: %s contains %d commits, comparing combined diffs instead (and ommitting commit message)\n", branch, potentialMerged.NumCommits)
+			}
+			fmt.Printf("%s\n", potentialMerged.DiffCmd)
+			fmt.Printf("git branch -D %s\n", branch)
+			fmt.Printf("\n")
 		}
 	}
 }
