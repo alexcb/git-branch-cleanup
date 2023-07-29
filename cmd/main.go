@@ -63,6 +63,14 @@ func getCommitSubject(commit string) (string, error) {
 	return runCommandTrimmedOutput("git", "--no-pager", "show", "--format=format:%s", "-s", commit)
 }
 
+func getCurrentBranch() (string, error) {
+	s, err := runCommandTrimmedOutput("git", "symbolic-ref", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimPrefix(s, "refs/heads/"), nil
+}
+
 func getCommitDiffOnly(commit string) (string, error) {
 	contents, err := runCommandTrimmedOutput("git", "--no-pager", "show", commit)
 	if err != nil {
@@ -130,6 +138,7 @@ func getGitDiff(start, end string) (string, error) {
 type PotentialMerge struct {
 	Branch       string
 	MergedSha    string
+	Merged       bool // true when the branch sha matches the merged sha (i.e. no rewritten history)
 	SubjectScore float32
 	DiffScore    float32
 	DiffSize     int
@@ -155,6 +164,7 @@ func findMerged(currentBranch, branch string) (*PotentialMerge, error) {
 		return &PotentialMerge{
 			Branch:       branch,
 			MergedSha:    base,
+			Merged:       true,
 			SubjectScore: 1.00,
 			DiffScore:    1.00,
 			NumCommits:   0,
@@ -250,9 +260,11 @@ func findMerged(currentBranch, branch string) (*PotentialMerge, error) {
 }
 
 type opts struct {
-	Verbose bool `long:"verbose" short:"v" description:"Enable verbose logging"`
-	Version bool `long:"version" short:"V" description:"Print version and exit"`
-	Perfect bool `long:"perfect" description:"only display perfect matches"`
+	Verbose         bool    `long:"verbose" short:"v" description:"Enable verbose logging"`
+	Version         bool    `long:"version" short:"V" description:"Print version and exit"`
+	Perfect         bool    `long:"perfect" description:"only display perfect matches"`
+	MinSubjectScore float32 `long:"min-subject-score" default:"0.9" description:"minimum subject score"`
+	MinDiffScore    float32 `long:"min-diff-score"  default:"0.9" description:"minimum diff score"`
 }
 
 func main() {
@@ -279,7 +291,18 @@ func main() {
 		die("failed to get branches: %v\n", err)
 	}
 
-	currentBranch := "main" // TODO use the actual current branch
+	currentBranch, err := getCurrentBranch()
+	if err != nil {
+		die("failed to get current branch: %v\n", err)
+	}
+
+	switch currentBranch {
+	case "main", "master", "trunk":
+		break
+	default:
+		die("current branch is %s; expected main, master, or trunk", currentBranch)
+	}
+
 	for _, branch := range branches {
 		if branch == currentBranch {
 			continue // dont try to delete the current branch (e.g. main)
@@ -293,7 +316,13 @@ func main() {
 			continue // likely not merged
 		}
 
-		if potentialMerged.SubjectScore > 0.9 && potentialMerged.DiffScore > 0.9 {
+		if potentialMerged.Merged {
+			fmt.Printf("%s was cleanly merged under %s\n", branch, potentialMerged.MergedSha)
+			fmt.Printf("git branch -D %s\n", branch)
+			continue
+		}
+
+		if potentialMerged.SubjectScore > progOpts.MinSubjectScore && potentialMerged.DiffScore > progOpts.MinDiffScore {
 			perfectDiffMatch := bool(potentialMerged.DiffScore == 1.0 && potentialMerged.DiffSize > 100)
 			if progOpts.Perfect {
 				if perfectDiffMatch {
