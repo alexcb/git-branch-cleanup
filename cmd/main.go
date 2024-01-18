@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 
 	"github.com/hyperjumptech/beda"
@@ -83,6 +84,30 @@ func getCommitDiffOnly(commit string) (string, error) {
 	return "diff --git" + parts[1], nil
 }
 
+// index 650fc525..aa3fa82c 100644
+var indexRegxp = regexp.MustCompile(`^index [0-9a-f]{8}\.\.[0-9a-f]{8} ([0-9]{6})$`)
+
+// index 00000000..eb2f469c
+var indexRegxpNewFile = regexp.MustCompile(`^index 0{8}\.\..*$`)
+
+// index edfb5027..00000000
+var indexRegxpDeleteFile = regexp.MustCompile(`^index [0-9a-f]{8}\.\..*$`)
+
+// @@ -6,6 +6,7 @@ ......................
+var changeLocation = regexp.MustCompile(`^@@ [^@]* @@`)
+
+func removeGitShaFromGitDiff(gitDiff string) string {
+	lines := strings.Split(gitDiff, "\n")
+	for i, l := range lines {
+		l = indexRegxp.ReplaceAllString(l, "index zzzzzzzz..zzzzzzzz $1")
+		l = indexRegxpNewFile.ReplaceAllString(l, "index 00000000..zzzzzzzz")
+		l = indexRegxpDeleteFile.ReplaceAllString(l, "index zzzzzzzz..00000000")
+		l = changeLocation.ReplaceAllString(l, "@@ ... @@")
+		lines[i] = l
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
 type CommitDiff struct {
 	Sha     string
 	Subject string
@@ -101,10 +126,14 @@ func getCommitDiff(commit string) (*CommitDiff, error) {
 	var commitDiff CommitDiff
 	var err error
 	commitDiff.Sha = commit
-	commitDiff.Diff, err = getCommitDiffOnly(commit)
+
+	gitDiff, err := getCommitDiffOnly(commit)
 	if err != nil {
 		return nil, err
 	}
+	gitDiff = removeGitShaFromGitDiff(gitDiff)
+	commitDiff.Diff = gitDiff
+
 	commitDiff.Subject, err = getCommitSubject(commit)
 	if err != nil {
 		return nil, err
@@ -219,6 +248,7 @@ func findMerged(currentBranch, branch string) (*PotentialMerge, error) {
 
 	var diffScore float32
 	if highestCombinedDiff == "" {
+
 		// check that the diff contents match too
 		sd := beda.NewStringDiff(branchDiff.Diff, highestDiff.Diff)
 		diffScore = sd.JaroWinklerDistance(0.1)
@@ -265,6 +295,12 @@ type opts struct {
 	Perfect         bool    `long:"perfect" description:"only display perfect matches"`
 	MinSubjectScore float32 `long:"min-subject-score" default:"0.9" description:"minimum subject score"`
 	MinDiffScore    float32 `long:"min-diff-score"  default:"0.9" description:"minimum diff score"`
+}
+
+func deleteBranch(branchName string) error {
+	fmt.Printf("deleting branch %s\n", branchName)
+	cmd := exec.Command("git", "branch", "-D", branchName)
+	return cmd.Run()
 }
 
 func main() {
@@ -318,24 +354,28 @@ func main() {
 
 		if potentialMerged.Merged {
 			fmt.Printf("%s was cleanly merged under %s\n", branch, potentialMerged.MergedSha)
-			fmt.Printf("git branch -D %s\n", branch)
+			if err := deleteBranch(branch); err != nil {
+				die("failed to delete branch %s: %v", branch, err)
+			}
+			fmt.Printf("\n")
 			continue
 		}
 
 		if potentialMerged.SubjectScore > progOpts.MinSubjectScore && potentialMerged.DiffScore > progOpts.MinDiffScore {
-			perfectDiffMatch := bool(potentialMerged.DiffScore == 1.0 && potentialMerged.DiffSize > 100)
-			if progOpts.Perfect {
-				if perfectDiffMatch {
-					fmt.Printf("git branch -D %s\n", branch)
-				}
-				continue
-			}
+			perfectDiffMatch := bool(potentialMerged.DiffScore == 1.0 && potentialMerged.DiffSize > 10)
 
 			if perfectDiffMatch {
 				fmt.Printf("%s was merged under %s (subject score: %f; diff score %f)\n", branch, potentialMerged.MergedSha, potentialMerged.SubjectScore, potentialMerged.DiffScore)
-			} else {
-				fmt.Printf("%s was **potentially** merged under %s (subject score: %f; diff score %f)\n", branch, potentialMerged.MergedSha, potentialMerged.SubjectScore, potentialMerged.DiffScore)
+				if err := deleteBranch(branch); err != nil {
+					die("failed to delete branch %s: %v", branch, err)
+				}
+				fmt.Printf("\n")
+				continue
 			}
+
+			// Code Diff is not perfect, don't auto-delete anything below
+
+			fmt.Printf("%s was **potentially** merged under %s (subject score: %f; diff score %f)\n", branch, potentialMerged.MergedSha, potentialMerged.SubjectScore, potentialMerged.DiffScore)
 			if potentialMerged.NumCommits > 1 {
 				fmt.Printf("WARNING: %s contains %d commits, comparing combined diffs instead (and ommitting commit message)\n", branch, potentialMerged.NumCommits)
 			}
